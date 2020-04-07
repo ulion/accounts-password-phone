@@ -69,7 +69,7 @@ const selectorFromUserQuery = function (user) {
     if (user.id)
         return { _id: user.id };
     else if (user.phone)
-        return { 'phone.number': normalizePhone(user.phone) };
+        return { 'services.phone.id': normalizePhone(user.phone) };
     throw new Error("shouldn't happen (validation missed something)");
 };
 
@@ -304,8 +304,8 @@ Accounts.sendPhoneVerificationCode = function (userId, phone) {
     if (!user)
         throw new Error("Can't find user");
     // pick the first unverified phone if we weren't passed an phone.
-    if (!phone && user.phone) {
-        phone = user.phone && user.phone.number;
+    if (!phone && user.services && user.services.phone) {
+        phone = user.services.phone.id;
     }
     // make sure we have a valid phone
     if (!phone)
@@ -364,14 +364,16 @@ Accounts.sendPhoneCode = function (userId, phone, reason = 'resetPassword') {
     // XXX Also generate a link using which someone can delete this
     // account if they own said number but weren't those who created
     // this account.
+    if (reason === 'id' || reason === 'verified')
+        throw new Error('Invaoid phone code reason');
 
     // Make sure the user exists, and phone is one of their phones.
     var user = Meteor.users.findOne(userId);
     if (!user)
         throw new Error("Can't find user");
     // pick the first unverified phone if we weren't passed an phone.
-    if (!phone && user.phone) {
-        phone = user.phone && user.phone.number;
+    if (!phone && user.services && user.services.phone) {
+        phone = user.services.phone.id;
     }
     // make sure we have a valid phone
     if (!phone)
@@ -449,7 +451,7 @@ Meteor.methods({
         var userId = this.userId;
         if (!userId) {
             // Get user by phone number
-            var existingUser = Meteor.users.findOne({ 'phone.number': phone }, { fields: { '_id': 1 } });
+            var existingUser = Meteor.users.findOne({ 'services.phone.id': phone }, { fields: { '_id': 1 } });
             if (existingUser) {
                 userId = existingUser && existingUser._id;
                 try {
@@ -489,7 +491,7 @@ Meteor.methods({
                 phone = normalizePhone(phone);
 
                 var user = Meteor.users.findOne({
-                    "phone.number": phone
+                    "services.phone.id": phone
                 });
                 if (!user)
                     throw new Meteor.Error(403, "Not a valid phone");
@@ -497,11 +499,13 @@ Meteor.methods({
                 // Verify code is accepted or master code
                 if (!user.services.phone || !user.services.phone.verify || !user.services.phone.verify.code ||
                     (user.services.phone.verify.code != code && !isMasterCode(code))) {
-                    throw new Meteor.Error(403, "Not a valid code");
+                    throw new Meteor.Error(403, "Invalid verification code");
                 }
 
-                var setOptions = { 'phone.verified': true },
-                    unSetOptions = { 'services.phone.verify': 1 };
+                var setOptions = {
+                    'services.phone.id': phone,
+                    'services.phone.verified': true,
+                }, unSetOptions = { 'services.phone.verify': 1 };
 
                 // If needs to update password
                 if (newPassword) {
@@ -525,7 +529,7 @@ Meteor.methods({
                 try {
                     var query = {
                         _id: user._id,
-                        'phone.number': phone,
+                        'services.phone.id': phone,
                         'services.phone.verify.code': code
                     };
                     // Allow master code from settings
@@ -562,7 +566,152 @@ Meteor.methods({
                 return { userId: user._id };
             }
         );
-    }
+    },
+
+    requestPhoneVerification2: function(phone) {
+        this.unblock();
+        if (phone) {
+            check(phone, String);
+            // Change phone format to international SMS format
+            phone = normalizePhone(phone);
+        }
+
+        if (!phone) {
+            throw new Meteor.Error(403, "Not a valid phone");
+        }
+
+        const userId = this.userId;
+        if (!userId) {
+            // Get user by phone number
+            const existingUser = Meteor.users.findOne({ 'services.phone.id': phone }, { fields: { '_id': 1 } });
+            if (existingUser) {
+                userId = existingUser && existingUser._id;
+                try {
+                    Accounts.sendPhoneCode(userId, phone, 'verify');
+                } catch (ex) {
+                    throw new Meteor.Error(400, ex);
+                }
+            } else {
+                // Throw error
+                throw new Meteor.Error(403, "Not a valid user");
+            }
+        }
+        else {
+            try {
+                Accounts.sendPhoneCode(userId, phone, 'verify');
+            } catch (ex) {
+                console.log('Accounts.sendPhoneCode failed:', ex);
+                throw new Meteor.Error(400, ex);
+            }
+        }
+    },
+
+    verifyPhone2: function(phone, code) {
+        this.unblock();
+        const self = this;
+        // Check if needs to change password
+        check(this.userId, String);
+        check(code, String);
+        check(phone, String);
+
+        if (!code) {
+            throw new Meteor.Error(403, "Code is must be provided to method");
+        }
+        // Change phone format to international SMS format
+        phone = normalizePhone(phone);
+
+        const user = Meteor.users.findOne(this.userId);
+        if (!user)
+            throw new Error("Can't find user");
+
+        // Verify code is accepted or master code
+        if (!user.services.phone || !user.services.phone.verify ||
+            user.services.phone.verify.phone !== phone || !user.services.phone.verify.code ||
+            (user.services.phone.verify.code !== code && !isMasterCode(code))) {
+            throw new Meteor.Error(403, "Invalid verification code");
+        }
+
+        // XXX: here possibially happen the merge with other account which has the verified phone number.
+        const setOptions = {
+            'services.phone.id': phone,
+            'services.phone.verified': true,
+        };
+        const unSetOptions = { 'services.phone.verify': 1 };
+
+        const otherUser = Meteor.users.findOne({
+            '_id': {
+                $ne: user._id,
+            },
+            'services.phone.id': phone,
+        });
+        if (otherUser) {
+            // XXX: there is other user who has the same phone setup.
+            if (otherUser.services.phone.verified) {
+                // it is a verified account. we do account merge? without asking user approve?
+                // Actually melds the two accounts (merge the other into current)
+                // XXX: clear current user's phone service to fully use the other user's verified phone state.
+                delete user.services.phone;
+                const meldResult = AccountsMeld.meldAccounts(otherUser, user);
+
+                if (!meldResult) {
+                    throw new Error('Existed other account has the same phone verified, and can not meld.');
+                }
+
+                return { userId: user._id, phone: phone, verified: true, meldFrom: otherUser._id };
+            }
+            else {
+                // not verified other account, clear the phone field of that user.
+                // FIXME: what if that account has no other login method there?
+                //        but with an unverified phone setup?
+                //        Some user doing the create user with phone verification but not finish the process?
+                //        so the user is indeed an invalid user? we should delete it for that case?
+                const otherUserServices = _.clone(otherUser.services);
+                delete otherUserServices.resume;
+                delete otherUserServices.phone;
+                if (otherUser.emails && otherUser.emails.length > 0 || Object.keys(otherUserServices).length > 0) {
+                    console.log('Clear unverified phone for other user:', otherUser._id, otherUser.services.phone);
+                    Meteor.users.update({
+                        '_id': otherUser._id
+                    }, {
+                        $unset: {
+                            'services.phone': 1,
+                        }
+                    });
+                }
+                else {
+                    // FIXME: delete the user.
+                    console.log('Clear unverified phone only other user:', otherUser._id, otherUser);
+                    Meteor.users.update({
+                        '_id': otherUser._id
+                    }, {
+                        $unset: {
+                            'services.phone': 1,
+                        }
+                    });
+                }
+            }
+        }
+        try {
+            const query = {
+                _id: user._id,
+            };
+            // Update the user record by:
+            // - Changing the password to the new one
+            // - Forgetting about the verification code that was just used
+            // - Verifying the phone, since they got the code via sms to phone.
+            const affectedRecords = Meteor.users.update(
+                query,
+                {
+                    $set: setOptions,
+                    $unset: unSetOptions
+                });
+        } catch (err) {
+
+            throw err;
+        }
+
+        return { userId: user._id, phone: phone, verified: true };
+    },
 });
 
 
@@ -605,7 +754,7 @@ Meteor.methods({
                 phone = normalizePhone(phone);
 
                 var user = Meteor.users.findOne({
-                    "phone.number": phone
+                    "services.phone.id": phone
                 });
                 if (!user)
                     throw new Meteor.Error(403, "Not a valid phone");
@@ -613,7 +762,7 @@ Meteor.methods({
                 // Verify code is accepted or master code
                 if (!user.services.phone || !user.services.phone.resetPassword || !user.services.phone.resetPassword.code ||
                     (user.services.phone.resetPassword.code != code && !isMasterCode(code))) {
-                    throw new Meteor.Error(403, "Not a valid code");
+                    throw new Meteor.Error(403, "Invalid verification code");
                 }
 
                 let tokenLifetimeMs = Accounts._getPasswordResetTokenLifetimeMs();
@@ -641,7 +790,7 @@ Meteor.methods({
                     const affectedRecords = Meteor.users.update(
                         {
                             _id: user._id,
-                            'phone.number': phone,
+                            'services.phone.id': phone,
                             'services.phone.resetPassword.code': code
                         },
                         {
@@ -695,7 +844,7 @@ var createUser = function (options) {
         throw new Meteor.Error(400, "Need to set phone");
 
     var existingUser = Meteor.users.findOne(
-        { 'phone.number': phone });
+        { 'services.phone.id': phone });
 
     if (existingUser) {
         throw new Meteor.Error(403, "User with this phone number already exists");
@@ -707,7 +856,7 @@ var createUser = function (options) {
         user.services.password = { bcrypt: hashed };
     }
 
-    user.phone = { number: phone, verified: false };
+    user.services.phone = { id: phone, verified: false };
 
     try {
         return Accounts.insertUserDoc(options, user);
@@ -794,29 +943,34 @@ Accounts.createUserWithPhone = function (options, callback) {
 ///
 /// PASSWORD-SPECIFIC INDEXES ON USERS
 ///
-Meteor.users._ensureIndex('phone.number',
+//Meteor.users._ensureIndex('phone.number',
+//    { unique: 1, sparse: 1 });
+Meteor.users._ensureIndex('services.phone.id',
     { unique: 1, sparse: 1 });
-Meteor.users._ensureIndex('services.phone.verify.code',
-    { unique: 1, sparse: 1 });
+/*Meteor.users._ensureIndex({
+    'services.phone.verify.phone': 1,
+    'services.phone.verify.code': 1,
+}, { unique: 1, sparse: 1 });*/
 
 /*** Control published data *********/
+
 Meteor.startup(function () {
     /** Publish phones to the client **/
-    Meteor.publish(null, function () {
+   /* Meteor.publish(null, function () {
         if (this.userId) {
             return Meteor.users.find({ _id: this.userId },
-                { fields: { 'phone': 1 } });
+                { fields: { 'services.phone.id': 1, 'services.phone.verified': 1 } });
         } else {
             this.ready();
         }
-    });
+    });*/
 
     /** Disable user profile editing **/
-    Meteor.users.deny({
+/*    Meteor.users.deny({
         update: function () {
             return true;
         }
-    });
+    });*/
 });
 
 /************* Phone verification hook *************/
